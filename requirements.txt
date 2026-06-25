@@ -1,0 +1,15 @@
+# 一卡通相片裁切工具  ·  必要套件
+Pillow>=10.0
+numpy>=1.24
+PyJWT>=2.8
+cryptography>=41.0
+
+# 選用：Excel 匯入
+openpyxl>=3.1
+
+# 選用：OCR（另需安裝 Tesseract-OCR 引擎）
+pytesseract>=0.3.10
+
+# 選用：AI 去背白底（首次執行自動下載模型 ~170MB，之後完全離線）
+rembg>=2.0.50
+onnxruntime>=1.16
