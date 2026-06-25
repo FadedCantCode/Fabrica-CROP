@@ -1,0 +1,6 @@
+fabrica_private.pem
+dev_console.py
+fabrica_licenses.json
+__pycache__/
+*.pyc
+.DS_Store
