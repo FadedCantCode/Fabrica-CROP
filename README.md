@@ -63,7 +63,7 @@ python photo_cutter.py
 
 ### 取得授權金鑰
 
-📧 聯繫：**fadedmailacc@gmail.com**（請替換為你的聯絡方式）
+📧 聯繫：**fadedmailacc@gmail.com**
 
 來信請附上：
 - 機構名稱
