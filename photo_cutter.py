@@ -320,6 +320,76 @@ def strip_photo_borders(arr, inset=2, max_frac=0.08):
     return result if result.size > 0 else arr
 
 
+def orient_image(img: Image.Image) -> Image.Image:
+    """
+    修正圖片方向（相片表 / 個別照片通用）：
+    1. 套用 EXIF Orientation（掃描機 / 相機寫入的旋轉角度）
+    2. 若仍橫式（寬 > 高 × 1.2）→ 順時針旋轉 90°
+
+    ⚠️ 相片表在 detect_grid 之前必須先呼叫此函式，
+       否則掃歪的表格 OCR 讀到的文字是斜的，完全辨識不了。
+    """
+    try:
+        img = ImageOps.exif_transpose(img)
+    except Exception:
+        pass
+    if img.width > img.height * 1.2:
+        img = img.transpose(Image.ROTATE_270)
+    return img
+
+
+def load_and_orient(path: str) -> Image.Image:
+    """
+    載入個別學生照片：orient_image（轉正）+ strip_photo_borders（去邊框）。
+    相片表請只用 orient_image()，不要 strip_photo_borders。
+    """
+    img = Image.open(path).convert('RGB')
+    img = orient_image(img)
+    arr = np.asarray(img)
+    cleaned = strip_photo_borders(arr)
+    return Image.fromarray(cleaned)
+
+
+def ocr_from_photo(img: Image.Image) -> str:
+    """
+    從個別學生照片辨識學號。
+    掃描底部 40% 區域（學號印刷處）+ 全圖，多門檻投票。
+    """
+    if not OCR_OK:
+        return ''
+    h, w = img.height, img.width
+    regions = [
+        img.crop((0, int(h * 0.60), w, h)),  # 底部 40%（學號印刷處）
+        img.crop((0, int(h * 0.80), w, h)),  # 底部 20%（更精準）
+        img,                                  # 全圖 fallback
+    ]
+    from collections import Counter
+    votes: Counter = Counter()
+    cfg = '-c tessedit_char_whitelist=0123456789'
+    for region in regions:
+        strip = region.convert('L')
+        # 放大 2-3x 提升辨識率
+        scale = max(2, min(3, 400 // max(strip.height, 1)))
+        strip = strip.resize((strip.width * scale, strip.height * scale), Image.LANCZOS)
+        strip = ImageOps.autocontrast(strip)
+        for thr in (120, 150, 180):
+            bw = strip.point(lambda v: 0 if v < thr else 255)
+            for psm in ('7', '6'):
+                try:
+                    txt = pytesseract.image_to_string(bw, config=f'--psm {psm} {cfg}')
+                    for num in re.findall(r'\d{6,8}', txt):
+                        votes[num] += 1
+                except Exception:
+                    pass
+    if not votes:
+        return ''
+    # 票數最多且長度合理的優先
+    ranked = sorted(votes.items(),
+                    key=lambda kv: (kv[1], 6 <= len(kv[0]) <= 8),
+                    reverse=True)
+    return ranked[0][0]
+
+
 def render_cell(cell, out_size=(420, 530)):
     """依 rotation 旋轉再縮放至輸出尺寸。"""
     im = cell['_orig']
@@ -523,6 +593,264 @@ def scan_folder(folder):
 # ════════════════════════════════════════════════════════════
 #  iPhone 等級精準裁切對話框
 # ════════════════════════════════════════════════════════════
+
+class GridEditorDialog(tk.Toplevel):
+    """
+    視覺化格線調整器：
+    顯示完整相片表，讓使用者手動拉線，解決格線偵測不準的問題。
+    • 左鍵點擊空白 → 加一條分割線
+    • 拖曳格線       → 移動位置
+    • 右鍵點擊格線  → 刪除
+    確認後以調整後的格線重新裁切。
+    """
+    LINE_HIT = 10  # 點擊判定距離（顯示像素）
+
+    def __init__(self, parent, img, col_bands, photo_rows, on_confirm):
+        super().__init__(parent)
+        self.title('🔧 調整格線 — 左鍵加線 / 拖曳移動 / 右鍵刪線')
+        self.resizable(True, True)
+        self.configure(bg=C['bg'])
+        self.img_orig = img
+        self.on_confirm = on_confirm
+
+        # 縮放比例
+        max_w, max_h = 900, 680
+        self.scale = min(max_w / img.width, max_h / img.height, 1.0)
+        self.dw = int(img.width  * self.scale)
+        self.dh = int(img.height * self.scale)
+
+        # 把 bands → 分割線（band 間隙中心，原圖座標）
+        self.col_divs = self._bands_to_divs(col_bands)
+        self.row_divs = self._bands_to_divs(photo_rows)
+        self.mode = tk.StringVar(value='col')
+        self._drag_idx = None
+        self._tk_img = None
+
+        self._build()
+        self._redraw()
+        self.transient(parent)
+        self.grab_set()
+
+    # ── 座標工具 ──────────────────────────────────────────────
+    def _to_d(self, v):  return int(v * self.scale)
+    def _from_d(self, v): return int(v / self.scale)
+
+    def _bands_to_divs(self, bands):
+        """bands → 間隙中心線（原圖座標）"""
+        divs = []
+        for i in range(len(bands) - 1):
+            divs.append((bands[i][1] + bands[i+1][0]) // 2)
+        return sorted(divs)
+
+    def _divs_to_bands(self, divs, total):
+        """分割線 → bands"""
+        pts = [0] + sorted(divs) + [total]
+        return [(pts[i], pts[i+1]) for i in range(len(pts)-1)]
+
+    def _nearest(self, display_pos, divs, threshold=None):
+        thr = threshold or self.LINE_HIT
+        best_i, best_d = None, float('inf')
+        for i, v in enumerate(divs):
+            d = abs(display_pos - self._to_d(v))
+            if d < best_d: best_d, best_i = d, i
+        return best_i if best_d <= thr else None
+
+    # ── 建構 UI ───────────────────────────────────────────────
+    def _build(self):
+        # 工具列
+        tb = tk.Frame(self, bg=C['surface'], pady=6,
+                      highlightbackground=C['line'], highlightthickness=1)
+        tb.pack(fill='x')
+
+        tk.Label(tb, text='調整模式：', bg=C['surface'], fg=C['ink'],
+                 font=(FONT,9)).pack(side='left', padx=(12,4))
+        for label, val, color in [('欄線（垂直）', 'col', C['accent']),
+                                    ('列線（水平）', 'row', '#1A7FBF')]:
+            rb = tk.Radiobutton(tb, text=label, variable=self.mode, value=val,
+                                bg=C['surface'], fg=color, selectcolor=C['surface'],
+                                activebackground=C['surface'],
+                                font=(FONT,9,'bold'), cursor='hand2',
+                                command=self._redraw)
+            rb.pack(side='left', padx=6)
+
+        tk.Label(tb, text='│  左鍵加線  拖曳移動  右鍵刪線',
+                 bg=C['surface'], fg=C['muted'], font=(FONT,8)).pack(side='left', padx=8)
+
+        self.info_lbl = tk.Label(tb, text='', bg=C['surface'],
+                                  fg=C['accent_dk'], font=(FONT,10,'bold'))
+        self.info_lbl.pack(side='right', padx=12)
+
+        fab_btn(tb, '確認套用', self._confirm).pack(side='right', padx=4, ipadx=10, ipady=3)
+        fab_btn(tb, '取消', self.destroy, 'ghost').pack(side='right', padx=(0,4), ipadx=8, ipady=3)
+
+        # Canvas
+        cf = tk.Frame(self, bg=C['bg']); cf.pack(padx=8, pady=8)
+        self.cv = tk.Canvas(cf, width=self.dw, height=self.dh,
+                            bg='#1a1a1a', highlightthickness=0, cursor='crosshair')
+        self.cv.pack()
+        self.cv.bind('<ButtonPress-1>',   self._on_press)
+        self.cv.bind('<B1-Motion>',       self._on_drag)
+        self.cv.bind('<ButtonRelease-1>', self._on_release)
+        self.cv.bind('<Button-3>',        self._on_right)
+
+    # ── 事件 ─────────────────────────────────────────────────
+    def _on_press(self, e):
+        divs = self.col_divs if self.mode.get() == 'col' else self.row_divs
+        pos  = e.x if self.mode.get() == 'col' else e.y
+        i = self._nearest(pos, divs)
+        if i is not None:
+            self._drag_idx = i          # 命中 → 準備拖曳
+        else:
+            # 沒命中 → 新增分割線
+            orig = self._from_d(pos)
+            divs.append(orig); divs.sort()
+            self._drag_idx = divs.index(orig)
+            self._redraw()
+
+    def _on_drag(self, e):
+        if self._drag_idx is None: return
+        divs = self.col_divs if self.mode.get() == 'col' else self.row_divs
+        pos  = e.x if self.mode.get() == 'col' else e.y
+        lim  = self.img_orig.width if self.mode.get() == 'col' else self.img_orig.height
+        new_val = max(0, min(lim, self._from_d(pos)))
+        if self._drag_idx < len(divs):
+            divs[self._drag_idx] = new_val
+            divs.sort()
+            self._drag_idx = divs.index(new_val)   # 排序後索引可能變
+        self._redraw()
+
+    def _on_release(self, _e): self._drag_idx = None
+
+    def _on_right(self, e):
+        divs = self.col_divs if self.mode.get() == 'col' else self.row_divs
+        pos  = e.x if self.mode.get() == 'col' else e.y
+        i = self._nearest(pos, divs)
+        if i is not None:
+            del divs[i]; self._redraw()
+
+    # ── 繪製 ─────────────────────────────────────────────────
+    def _redraw(self):
+        disp = self.img_orig.resize((self.dw, self.dh), Image.LANCZOS)
+        d = ImageDraw.Draw(disp)
+
+        # 欄線（橘）
+        for x in self.col_divs:
+            dx = self._to_d(x)
+            d.line([(dx,0),(dx,self.dh)], fill=C['accent'], width=2)
+            # 小三角指示
+            d.polygon([(dx-6,0),(dx+6,0),(dx,10)], fill=C['accent'])
+            d.polygon([(dx-6,self.dh),(dx+6,self.dh),(dx,self.dh-10)], fill=C['accent'])
+
+        # 列線（藍）
+        for y in self.row_divs:
+            dy = self._to_d(y)
+            d.line([(0,dy),(self.dw,dy)], fill='#1A7FBF', width=2)
+            d.polygon([(0,dy-6),(0,dy+6),(10,dy)], fill='#1A7FBF')
+            d.polygon([(self.dw,dy-6),(self.dw,dy+6),(self.dw-10,dy)], fill='#1A7FBF')
+
+        # 統計
+        nc = len(self.col_divs)+1; nr = len(self.row_divs)+1
+        self.info_lbl.config(text=f'{nc} 欄 × {nr} 列 = {nc*nr} 格')
+        self._tk_img = ImageTk.PhotoImage(disp)
+        self.cv.delete('all')
+        self.cv.create_image(0,0,anchor='nw',image=self._tk_img)
+
+    # ── 確認 ─────────────────────────────────────────────────
+    def _confirm(self):
+        col_bands  = self._divs_to_bands(self.col_divs, self.img_orig.width)
+        photo_rows = self._divs_to_bands(self.row_divs, self.img_orig.height)
+        self.on_confirm(col_bands, photo_rows)
+        self.destroy()
+
+
+class CellSplitDialog(tk.Toplevel):
+    """
+    格子分割對話框：
+    當一個格子裡有兩位學生時，拖曳橘色分割線到兩人之間，
+    按「確認分割」後，當前格子自動拆成兩個獨立格子。
+    """
+    def __init__(self, parent, cell, on_split):
+        super().__init__(parent)
+        self.title('格子分割 — 拖曳橘線到兩人之間')
+        self.resizable(False, False)
+        self.configure(bg=C['bg'])
+        self.on_split = on_split
+
+        # 取得已旋轉的原始影像
+        src = cell['_orig']
+        r = cell['rotation'] % 360
+        if r == 90:  src = src.transpose(Image.ROTATE_270)
+        elif r == 180: src = src.transpose(Image.ROTATE_180)
+        elif r == 270: src = src.transpose(Image.ROTATE_90)
+        self.src = src
+
+        max_w, max_h = 820, 560
+        self.scale = min(max_w / src.width, max_h / src.height, 1.8)
+        self.dw = int(src.width  * self.scale)
+        self.dh = int(src.height * self.scale)
+
+        self.split_x = src.width // 2   # 初始分割線在中央
+        self._tk_img = None
+        self._build(); self._redraw()
+        self.transient(parent); self.grab_set()
+
+    def _build(self):
+        tb = tk.Frame(self, bg=C['surface'],
+                      highlightbackground=C['line'], highlightthickness=1)
+        tb.pack(fill='x', pady=0)
+        tk.Label(tb, text='拖曳橘色線到兩位學生之間的空隙',
+                 bg=C['surface'], fg=C['ink'], font=(FONT,10,'bold')).pack(side='left', padx=14, pady=8)
+        fab_btn(tb, '確認分割', self._confirm).pack(side='right', padx=12, pady=6, ipadx=12, ipady=4)
+        fab_btn(tb, '取消', self.destroy, 'ghost').pack(side='right', padx=(0,4), pady=6, ipadx=8, ipady=4)
+
+        self.cv = tk.Canvas(self, width=self.dw, height=self.dh,
+                            bg='#1a1a1a', highlightthickness=0,
+                            cursor='sb_h_double_arrow')
+        self.cv.pack(padx=8, pady=(6,4))
+        self.cv.bind('<ButtonPress-1>', self._move)
+        self.cv.bind('<B1-Motion>',     self._move)
+
+        self.size_lbl = tk.Label(self, text='', bg=C['bg'], fg=C['muted'], font=(FONT,8))
+        self.size_lbl.pack(pady=(0,6))
+
+    def _move(self, e):
+        self.split_x = max(8, min(self.src.width - 8, int(e.x / self.scale)))
+        self._redraw()
+
+    def _redraw(self):
+        disp = self.src.resize((self.dw, self.dh), Image.LANCZOS)
+        dx = int(self.split_x * self.scale)
+
+        # 兩側輕微暗化
+        ov = Image.new('RGBA', (self.dw, self.dh), (0,0,0,0))
+        ImageDraw.Draw(ov).rectangle([dx, 0, self.dw, self.dh], fill=(0,0,0,40))
+        disp = disp.convert('RGBA'); disp.alpha_composite(ov); disp = disp.convert('RGB')
+
+        d = ImageDraw.Draw(disp)
+        # 分割線
+        d.line([(dx,0),(dx,self.dh)], fill=C['accent'], width=3)
+        # 箭頭提示
+        sz = 12
+        d.polygon([(dx,sz*2),(dx-sz,sz),(dx+sz,sz)],    fill=C['accent'])
+        d.polygon([(dx,self.dh-sz*2),(dx-sz,self.dh-sz),(dx+sz,self.dh-sz)], fill=C['accent'])
+        # 寬度標記
+        lw = self.split_x; rw = self.src.width - self.split_x
+        d.text((max(2, dx//2-20), 4), f'← {lw}px →', fill=C['accent'])
+        d.text((dx+4, 4), f'← {rw}px →', fill='#1A7FBF')
+
+        self.size_lbl.config(text=f'左格 {lw}px ｜ 右格 {rw}px ｜ 分割線 x={self.split_x}')
+        self._tk_img = ImageTk.PhotoImage(disp)
+        self.cv.delete('all')
+        self.cv.create_image(0, 0, anchor='nw', image=self._tk_img)
+
+    def _confirm(self):
+        if self.split_x < 10 or self.split_x > self.src.width - 10:
+            messagebox.showwarning('', '分割線太靠邊，請移到兩人中間'); return
+        left  = self.src.crop((0, 0, self.split_x, self.src.height))
+        right = self.src.crop((self.split_x, 0, self.src.width, self.src.height))
+        self.on_split(left, right)
+        self.destroy()
+
 
 class CropperDialog(tk.Toplevel):
     """
@@ -797,7 +1125,7 @@ class SheetTab(tk.Frame):
         self.img_lbl.pack(side='left', fill='x', expand=True)
         fab_btn(fr,'選擇圖片',self._pick_img).pack(side='right', ipadx=8, ipady=3)
 
-        gr = tk.Frame(s1, bg=C['surface']); gr.pack(fill='x', padx=12, pady=(0,8))
+        gr = tk.Frame(s1, bg=C['surface']); gr.pack(fill='x', padx=12, pady=(0,4))
         tk.Checkbutton(gr, text='自動偵測欄列', variable=self.auto_var, bg=C['surface'],
                        fg=C['ink'], selectcolor=C['surface'], activebackground=C['surface'],
                        font=(FONT,9), command=self._toggle_auto).pack(side='left', padx=(0,12))
@@ -809,8 +1137,17 @@ class SheetTab(tk.Frame):
         self.col_sp.pack(side='left', padx=(0,8))
         tk.Label(gr, text='列：', bg=C['surface'], fg=C['ink'], font=(FONT,9)).pack(side='left')
         self.row_sp.pack(side='left')
-        self.grid_lbl = tk.Label(s1, text='', bg=C['surface'], fg=C['accent_dk'], font=(FONT,9))
-        self.grid_lbl.pack(anchor='w', padx=12, pady=(0,8))
+        gl_row = tk.Frame(s1, bg=C['surface']); gl_row.pack(fill='x', padx=12, pady=(0,8))
+        self.grid_lbl = tk.Label(gl_row, text='', bg=C['surface'], fg=C['accent_dk'],
+                                  font=(FONT,9), anchor='w')
+        self.grid_lbl.pack(side='left', fill='x', expand=True)
+        self.adj_btn = fab_btn(gl_row, '🔧 調整格線', self._open_grid_editor, 'ghost')
+        self.adj_btn.pack(side='right', ipadx=6, ipady=2)
+        self.adj_btn.config(state='disabled')
+        Tooltip(self.adj_btn,
+                '若有照片被誤切（兩人一格、格線偏移），\n'
+                '點此開啟視覺化格線編輯器手動調整。\n'
+                '左鍵加線 ｜ 拖曳移動 ｜ 右鍵刪線')
 
         # ── Step 2: Excel ──
         w2, s2 = fab_card(body, '步驟二　（選用）匯入 Excel 學號')
@@ -855,6 +1192,10 @@ class SheetTab(tk.Frame):
         b_crop = fab_btn(pv,'✂ 精準裁切',self._open_cropper,'ink')
         b_crop.pack(pady=3,fill='x')
         Tooltip(b_crop, '開啟裁切視窗：拖曳移動、滾輪縮放\n可以去除邊框或調整構圖')
+
+        b_split = fab_btn(pv,'⊞ 分割格子',self._split_cell,'ghost')
+        b_split.pack(pady=3,fill='x')
+        Tooltip(b_split, '當一個格子裡有兩位學生時，\n拖曳橘線到兩人中間 → 拆成兩個獨立格子')
 
         b_mat = fab_btn(pv,'🪄 去背白底',self._apply_matting,
                         'primary' if (REMBG_OK and LICENSE.allowed('matting')) else 'ghost')
@@ -957,6 +1298,7 @@ class SheetTab(tk.Frame):
     def _load_image(self):
         if not self.img_path: return
         self.img = Image.open(self.img_path).convert('RGB')
+        self.img = orient_image(self.img)   # ← 先轉正，OCR 才能讀到正確方向的文字
         fc = fr = None
         if not self.auto_var.get(): fc, fr = self.cols_var.get(), self.rows_var.get()
         pd = ProgressDlg(self.app, '正在偵測格線…', 100)
@@ -979,6 +1321,11 @@ class SheetTab(tk.Frame):
                 f'升級 Pro 方案可無限制使用。')
             self.cells = self.cells[:max_c]
         self.grid_lbl.config(text=f'偵測 {len(col_bands)}欄 × {len(photo_rows)}列，擷取 {len(self.cells)} 張')
+
+        # 儲存格線供格線編輯器使用
+        self._col_bands = col_bands
+        self._photo_rows = photo_rows
+        self._source_img = self.img
         check_duplicates(self.cells)
         if self._load_session():
             pass
@@ -987,6 +1334,7 @@ class SheetTab(tk.Frame):
         self.next_btn.config(state='normal')
         self.export_btn.config(state='normal')
         self.quick_btn.config(state='normal')
+        self.adj_btn.config(state='normal')   # 啟用格線調整按鈕
         if self.excel_data and self.col_combo.get():
             self._apply_excel(self.col_combo.get(), only_blank=True)
         # ── OCR 背景執行緒（Scholar/Pro/Enterprise 才有）──
@@ -1026,6 +1374,50 @@ class SheetTab(tk.Frame):
         check_duplicates(self.cells); self._refresh_list()
         if self.excel_data and self.col_combo.get():
             self._apply_excel(self.col_combo.get(), only_blank=True)
+
+    def _open_grid_editor(self):
+        """開啟視覺化格線編輯器，讓使用者手動調整欄列分割線。"""
+        if not hasattr(self, '_col_bands') or self._col_bands is None:
+            messagebox.showinfo('', '請先載入相片表圖片'); return
+        GridEditorDialog(self.app, self._source_img,
+                         self._col_bands, self._photo_rows,
+                         self._reextract_with_bands)
+
+    def _reextract_with_bands(self, col_bands, photo_rows):
+        """格線調整後，用新的 bands 重新裁切（保留已填的學號）。"""
+        # 先備份現有學號
+        old_ids = {(c['row'], c['col']): c['id'] for c in self.cells}
+        self._col_bands   = col_bands
+        self._photo_rows  = photo_rows
+        new_cells = extract_cells(self._source_img, col_bands, photo_rows)
+        # 恢復學號（按位置配對）
+        for c in new_cells:
+            c['id'] = old_ids.get((c['row'], c['col']), '')
+            c.setdefault('excel_name', '')
+            c.setdefault('dup', False)
+        self.cells = new_cells
+        nc, nr = len(col_bands), len(photo_rows)
+        self.grid_lbl.config(
+            text=f'（手動調整）{nc}欄 × {nr}列，擷取 {len(new_cells)} 張')
+        check_duplicates(self.cells); self._refresh_list()
+        if self.cells:
+            self._show(min(self.current, len(self.cells)-1))
+        # 重新跑 OCR（只補空白）
+        if OCR_OK and LICENSE.allowed('ocr'):
+            self._ocr_running = True
+            self.export_btn.config(state='disabled', text='⋯ OCR 辨識中，請稍候')
+            self.quick_btn.config(state='disabled')
+            row_tops = sorted({c['_cell_box'][1] for c in self.cells})
+            def _worker():
+                for k, c in enumerate(self.cells):
+                    if c['id']: continue   # 跳過已有學號
+                    y = c['_cell_box'][1]
+                    later = [t for t in row_tops if t > y]
+                    c['id'] = ocr_id_below(self._source_img, c['_cell_box'],
+                                           next_row_top=min(later) if later else None)
+                    self.app.after(0, lambda k=k: self._on_ocr_step(k))
+                self.app.after(0, self._on_ocr_done)
+            threading.Thread(target=_worker, daemon=True).start()
 
     def _pick_excel(self):
         if not EXCEL_OK: messagebox.showerror('缺少套件','pip install openpyxl'); return
@@ -1136,8 +1528,37 @@ class SheetTab(tk.Frame):
         if not self.cells: return
         self._save_cur()
         dlg = CropperDialog(self.app, self.cells[self.current])
-        self.app.wait_window(dlg)   # 等對話框真正關閉後才刷新預覽
+        self.app.wait_window(dlg)
         self._show(self.current)
+
+    def _split_cell(self):
+        """把當前格子（含兩位學生）拆成左右兩個獨立格子。"""
+        if not self.cells: return
+        self._save_cur()
+
+        def on_split(left_img, right_img):
+            c = self.cells[self.current]
+            c_left = {
+                'row': c['row'], 'col': c['col'],
+                '_orig': left_img, 'rotation': 0,
+                'id': '', '_cell_box': c['_cell_box'],
+                'excel_name': '', 'dup': False,
+            }
+            c_left['image'] = render_cell(c_left)
+            c_right = {
+                'row': c['row'], 'col': c['col'] + 0.5,
+                '_orig': right_img, 'rotation': 0,
+                'id': '', '_cell_box': c['_cell_box'],
+                'excel_name': '', 'dup': False,
+            }
+            c_right['image'] = render_cell(c_right)
+            idx = self.current
+            self.cells[idx:idx+1] = [c_left, c_right]
+            check_duplicates(self.cells)
+            self._refresh_list()
+            self._show(idx)
+
+        CellSplitDialog(self.app, self.cells[self.current], on_split)
 
     def _apply_matting(self, all_cells=False):
         if not self.cells: return
@@ -1320,116 +1741,162 @@ class SheetTab(tk.Frame):
 
 class BatchTab(tk.Frame):
     """
-    資料夾 → 逐張個別照片 → 比對 Excel 學生名單
-    支援 600+ 學生。自動配對、缺件標示、批次匯出。
+    批次相片表模式：
+    選擇一個資料夾，裡面放多張「班級相片表」圖片（每張表有多位學生）。
+    對每張表執行格線偵測 + 格子裁切 + OCR，
+    合併所有班級的學生，逐張確認學號後統一匯出 ZIP。
     """
-    STATUS_COLOR = {'matched': '#1FA85B', 'unmatched': '#D8A000',
-                    'missing': '#D8452F', 'orphan': '#8C8474'}
 
     def __init__(self, parent, app):
         super().__init__(parent, bg=C['bg'])
         self.app = app
         self.folder = ''
         self.excel_data = {}; self.excel_headers = []
-        self.items = []       # 全部條目
-        self.filtered = []    # 目前顯示的條目（indices into self.items）
-        self.current = -1
-        self.filter_var = tk.StringVar(value='all')
+        self.cells = []      # 所有表格、所有學生，扁平化
+        self.current = 0
+        self._ocr_running = False
+        self._list_map = []
         self._build()
 
-    # item 結構:
-    # { type:'matched'|'unmatched'|'missing'|'orphan',
-    #   path:str|None, filename:str, id:str, auto_id:str,
-    #   excel_name:str, _img:PIL|None }
+    # ── 共用 UI 工具 ──────────────────────────────────────────
+
+    def _btn(self, parent, text, cmd, kind='primary', **kw):
+        bg = {'primary':C['accent'],'ink':C['ink'],'ghost':C['surface2']}[kind]
+        fg = C['ink'] if kind == 'ghost' else 'white'
+        return tk.Button(parent, text=text, command=cmd, bg=bg, fg=fg,
+                         relief='flat', font=(FONT,9,'bold'), cursor='hand2',
+                         activebackground=C['accent_dk'] if kind=='primary' else bg,
+                         activeforeground='white', bd=0, **kw)
 
     def _build(self):
-        body = tk.Frame(self, bg=C['bg']); body.pack(fill='both',expand=True,padx=18,pady=12)
+        body = tk.Frame(self, bg=C['bg'])
+        body.pack(fill='both', expand=True, padx=18, pady=12)
 
         # ── 控制列 ──
         ctrl = tk.Frame(body, bg=C['bg']); ctrl.pack(fill='x', pady=(0,10))
 
         wf, sf = fab_card(ctrl, '資料來源')
         wf.pack(side='left', fill='both', expand=True, padx=(0,8))
-        fab_btn(sf,'選擇照片資料夾',self._pick_folder).pack(anchor='w',padx=12,pady=(10,4),ipadx=6,ipady=3)
-        self.folder_lbl = tk.Label(sf, text='尚未選擇…', bg=C['surface'], fg=C['muted'],
-                                   font=(FONT,8), anchor='w')
-        self.folder_lbl.pack(anchor='w',padx=12,pady=(0,4))
-        fab_btn(sf,'選擇 Excel 學生名單',self._pick_excel,'ink').pack(anchor='w',padx=12,pady=(0,4),ipadx=6,ipady=3)
-        self.excel_lbl = tk.Label(sf, text='尚未選擇…', bg=C['surface'], fg=C['muted'],
-                                  font=(FONT,8), anchor='w')
-        self.excel_lbl.pack(anchor='w',padx=12,pady=(0,8))
 
+        fr1 = tk.Frame(sf, bg=C['surface']); fr1.pack(fill='x', padx=12, pady=(10,4))
+        self.folder_lbl = tk.Label(fr1, text='尚未選擇相片表資料夾…',
+                                    bg=C['surface'], fg=C['muted'], anchor='w', font=(FONT,8))
+        self.folder_lbl.pack(side='left', fill='x', expand=True)
+        b_folder = self._btn(fr1, '選擇資料夾', self._pick_folder)
+        b_folder.pack(side='right', ipadx=8, ipady=3)
+        Tooltip(b_folder, '選擇裝有相片表圖片的資料夾\n（每張圖片是一張班級相片表，含多位學生）')
+
+        fr2 = tk.Frame(sf, bg=C['surface']); fr2.pack(fill='x', padx=12, pady=(0,8))
+        self.xl_lbl = tk.Label(fr2, text='（選用）Excel 學生名單…',
+                                bg=C['surface'], fg=C['muted'], anchor='w', font=(FONT,8))
+        self.xl_lbl.pack(side='left', fill='x', expand=True)
+        b_xl = self._btn(fr2, '選擇 Excel', self._pick_excel, 'ink')
+        b_xl.pack(side='right', ipadx=8, ipady=3)
+        Tooltip(b_xl, '匯入 Excel 學生名單\nOCR 辨識後會自動比對姓名')
+        self.xl_col_combo = ttk.Combobox(sf, state='disabled', width=16, font=(FONT,9))
+        self.xl_col_combo.pack(anchor='w', padx=12, pady=(0,8))
+        self.xl_col_combo.bind('<<ComboboxSelected>>', self._on_col_select)
+
+        # 統計
         ws, ss = fab_card(ctrl, '統計')
         ws.pack(side='left', fill='y')
         self.stat_lbl = tk.Label(ss, text='—', bg=C['surface'], fg=C['ink'],
-                                 font=(FONT,10), justify='left', padx=12, pady=10)
+                                  font=(FONT,9), justify='left', padx=12, pady=8)
         self.stat_lbl.pack()
 
-        # ── 篩選鈕 ──
-        ff = tk.Frame(body, bg=C['bg']); ff.pack(fill='x', pady=(0,6))
-        for text, val in [('全部','all'),('已配對','matched'),('未配對','unmatched'),
-                          ('缺照片','missing'),('孤立照片','orphan')]:
-            rb = tk.Radiobutton(ff, text=text, variable=self.filter_var, value=val,
-                                bg=C['bg'], fg=C['ink'], selectcolor=C['bg'],
-                                activebackground=C['bg'], font=(FONT,9), cursor='hand2',
-                                command=self._apply_filter)
-            rb.pack(side='left', padx=(0,10))
+        # ── 逐張確認面板（與 SheetTab 相同設計）──
+        w3, s3 = fab_card(body, '逐張確認學號')
+        w3.pack(fill='both', expand=True, pady=(0,8))
+        prow = tk.Frame(s3, bg=C['surface']); prow.pack(fill='both', expand=True, padx=12, pady=10)
 
-        # ── 主清單 + 預覽 ──
-        mid = tk.Frame(body, bg=C['bg']); mid.pack(fill='both', expand=True)
+        # 左：預覽
+        pv = tk.Frame(prow, bg=C['surface']); pv.pack(side='left', padx=(0,12))
+        self.photo_lbl = tk.Label(pv, bg=C['surface2'], width=160, height=200,
+                                   text='尚未載入', font=(FONT,9), fg=C['muted'],
+                                   highlightbackground=C['line'], highlightthickness=1,
+                                   cursor='hand2')
+        self.photo_lbl.pack()
+        self.photo_lbl.bind('<Button-1>', lambda e: self._zoom_preview())
+        tk.Label(pv, text='點擊放大', bg=C['surface'], fg=C['muted'], font=(FONT,7)).pack()
 
-        # 清單
-        lf = tk.Frame(mid, bg=C['bg']); lf.pack(side='left', fill='both', expand=True, padx=(0,10))
-        lb_f = tk.Frame(lf, bg=C['surface'], highlightbackground=C['line'], highlightthickness=1)
-        lb_f.pack(fill='both', expand=True)
-        sb = tk.Scrollbar(lb_f); sb.pack(side='right', fill='y')
-        self.listbox = tk.Listbox(lb_f, font=(FONT,9), yscrollcommand=sb.set,
-                                  activestyle='none', bd=0, highlightthickness=0,
-                                  selectbackground=C['accent'], selectforeground='white')
+        rotf = tk.Frame(pv, bg=C['surface']); rotf.pack(pady=3)
+        self._btn(rotf,'↺',lambda:self._rotate(-90),'ghost').pack(side='left',padx=2,ipadx=6,ipady=2)
+        self._btn(rotf,'↻',lambda:self._rotate(90),'ghost').pack(side='left',padx=2,ipadx=6,ipady=2)
+        self._btn(pv,'✂ 精準裁切',self._open_cropper,'ink').pack(pady=3,fill='x')
+        self._btn(pv,'⊞ 分割格子',self._split_cell,'ghost').pack(pady=3,fill='x')
+        b_mat = self._btn(pv,'🪄 去背白底',self._apply_matting,
+                           'primary' if (REMBG_OK and LICENSE.allowed('matting')) else 'ghost')
+        b_mat.pack(pady=3,fill='x')
+        if not REMBG_OK or not LICENSE.allowed('matting'): b_mat.config(state='disabled')
+        self.prog_lbl = tk.Label(pv, text='', bg=C['surface'], fg=C['muted'], font=(FONT,8))
+        self.prog_lbl.pack(pady=(4,0))
+
+        # 右：學號 + 來源 + 清單
+        rv = tk.Frame(prow, bg=C['surface']); rv.pack(side='left', fill='both', expand=True)
+        self.name_lbl = tk.Label(rv, text='', bg=C['surface'], fg=C['accent_dk'],
+                                  font=(FONT,13,'bold'))
+        self.name_lbl.pack(anchor='w')
+        self.sheet_lbl = tk.Label(rv, text='', bg=C['surface'], fg=C['muted'], font=(FONT,8))
+        self.sheet_lbl.pack(anchor='w')
+        tk.Label(rv, text='學號', bg=C['surface'], fg=C['ink'], font=(FONT,10,'bold')).pack(anchor='w')
+        self.id_var = tk.StringVar()
+        self.id_entry = tk.Entry(rv, textvariable=self.id_var, font=(FONT,22,'bold'),
+                                  width=11, relief='flat', bd=0, fg=C['ink'],
+                                  highlightbackground=C['accent'], highlightcolor=C['accent'],
+                                  highlightthickness=2)
+        self.id_entry.pack(anchor='w', pady=(2,1))
+        self.id_entry.bind('<Return>', lambda e: self._next())
+        self.id_entry.bind('<KP_Enter>', lambda e: self._next())
+        self.dup_lbl = tk.Label(rv, text='', bg=C['surface'], font=(FONT,8))
+        self.dup_lbl.pack(anchor='w')
+
+        nav = tk.Frame(rv, bg=C['surface']); nav.pack(anchor='w', pady=6)
+        self.prev_btn = self._btn(nav,'◀ 上一張',self._prev,'ink')
+        self.prev_btn.pack(side='left', padx=(0,6), ipadx=8, ipady=3)
+        self.prev_btn.config(state='disabled')
+        self.next_btn = self._btn(nav,'下一張 ▶',self._next)
+        self.next_btn.pack(side='left', ipadx=8, ipady=3)
+        self.next_btn.config(state='disabled')
+
+        sf2 = tk.Frame(rv, bg=C['surface']); sf2.pack(fill='x', pady=(6,2))
+        tk.Label(sf2, text='搜尋：', bg=C['surface'], fg=C['muted'], font=(FONT,8)).pack(side='left')
+        self.search_var = tk.StringVar()
+        self.search_var.trace_add('write', lambda *_: self._refresh_list())
+        tk.Entry(sf2, textvariable=self.search_var, font=(FONT,9), width=12,
+                 relief='solid', bd=1).pack(side='left', padx=2)
+
+        lb = tk.Frame(rv, bg=C['surface']); lb.pack(fill='both', expand=True)
+        sb = tk.Scrollbar(lb); sb.pack(side='right', fill='y')
+        self.listbox = tk.Listbox(lb, font=(FONT,9), height=7, yscrollcommand=sb.set,
+                                   activestyle='none', bd=0, highlightthickness=1,
+                                   highlightbackground=C['line'],
+                                   selectbackground=C['accent'], selectforeground='white')
         self.listbox.pack(fill='both', expand=True)
         self.listbox.bind('<<ListboxSelect>>', self._on_list)
         sb.config(command=self.listbox.yview)
 
-        # 預覽面板
-        pf = tk.Frame(mid, bg=C['surface'], width=280,
-                      highlightbackground=C['line'], highlightthickness=1)
-        pf.pack(side='left', fill='y'); pf.pack_propagate(False)
-        self.preview = tk.Label(pf, bg=C['surface2'], width=240, height=300,
-                                text='選擇項目', font=(FONT,9), fg=C['muted'])
-        self.preview.pack(padx=16, pady=16)
-        self.status_lbl = tk.Label(pf, text='', bg=C['surface'], fg=C['ink'],
-                                   font=(FONT,9), wraplength=240, justify='left')
-        self.status_lbl.pack(padx=16, pady=(0,8))
-        tk.Label(pf, text='手動指定學號', bg=C['surface'], fg=C['muted'], font=(FONT,8)).pack(anchor='w', padx=16)
-        self.batch_id_var = tk.StringVar()
-        ie = tk.Entry(pf, textvariable=self.batch_id_var, font=(FONT,14,'bold'),
-                      width=12, relief='flat', bd=0, fg=C['ink'],
-                      highlightbackground=C['accent'], highlightcolor=C['accent'],
-                      highlightthickness=2)
-        ie.pack(padx=16, pady=(2,6))
-        ie.bind('<Return>', lambda e: self._assign_id())
-        fab_btn(pf,'套用學號',self._assign_id).pack(padx=16,pady=(0,6),fill='x',ipadx=4,ipady=3)
-        fab_btn(pf,'✂ 精準裁切',self._open_cropper,'ink').pack(padx=16,pady=(0,16),fill='x',ipadx=4,ipady=3)
-
-        # ── 匯出列 ──
-        ef = tk.Frame(body, bg=C['bg']); ef.pack(fill='x', pady=(8,0))
-        self.export_btn = fab_btn(ef,'批次匯出 ZIP　→',self._export)
-        self.export_btn.config(font=(FONT,12,'bold'), state='disabled')
+        # ── 匯出 ──
+        ef = tk.Frame(body, bg=C['bg']); ef.pack(fill='x')
+        self.export_btn = self._btn(ef,'批次儲存 ZIP　→',self._export)
+        self.export_btn.config(font=(FONT,11,'bold'), state='disabled')
         self.export_btn.pack(side='left', fill='x', expand=True, ipady=10)
-        self.matting_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(ef, text='🪄 去背白底', variable=self.matting_var,
-                       bg=C['bg'], fg=C['ink'] if REMBG_OK else C['muted'],
-                       selectcolor=C['bg'], activebackground=C['bg'],
-                       font=(FONT,9,'bold'),
-                       state='normal' if REMBG_OK else 'disabled').pack(side='left',padx=8)
-        fab_btn(ef,'CSV 報表',self._export_csv,'ghost').pack(side='left',padx=(6,0),ipady=10,ipadx=10)
+        self.quick_btn = self._btn(ef,'⚡ 信任 OCR 直接存',self._quick_export,'ink')
+        self.quick_btn.config(state='disabled')
+        self.quick_btn.pack(side='left', padx=(6,0), ipady=10, ipadx=8)
+        self._btn(ef,'CSV 報表',self._export_csv,'ghost').pack(side='left',padx=(6,0),ipady=10,ipadx=10)
+
+        # 鍵盤
+        self.bind_all('<Left>',  lambda e: self._prev() if self.cells else None)
+        self.bind_all('<Right>', lambda e: self._next() if self.cells else None)
+
+    # ── 資料載入 ──────────────────────────────────────────────
 
     def _pick_folder(self):
-        folder = filedialog.askdirectory(title='選擇照片資料夾')
+        folder = filedialog.askdirectory(title='選擇相片表資料夾（每個圖片是一張班級相片表）')
         if not folder: return
         self.folder = folder
         self.folder_lbl.config(text=folder, fg=C['ink'])
-        self._build_items()
+        self._process_all_sheets()
 
     def _pick_excel(self):
         if not EXCEL_OK: messagebox.showerror('缺少套件','pip install openpyxl'); return
@@ -1439,200 +1906,317 @@ class BatchTab(tk.Frame):
         try: data, hdrs = load_excel(path)
         except Exception as e: messagebox.showerror('讀取失敗',str(e)); return
         self.excel_data, self.excel_headers = data, hdrs
-        self.excel_lbl.config(text=os.path.basename(path), fg=C['ink'])
-        self._build_items()
+        self.xl_lbl.config(text=os.path.basename(path), fg=C['ink'])
+        self.xl_col_combo.config(values=hdrs, state='readonly')
+        g = guess_id_col(data, hdrs)
+        if g: self.xl_col_combo.set(g); self._on_col_select(None)
 
-    def _build_items(self):
-        if not self.folder: return
-        try: photos = scan_folder(self.folder)
-        except RuntimeError as e: messagebox.showerror('錯誤',str(e)); return
+    def _on_col_select(self, _e):
+        col = self.xl_col_combo.get()
+        if not col or col not in self.excel_data: return
+        if not self.cells: return
+        vals = [v for v in self.excel_data[col] if v.strip()]
+        name_col = next((h for h in self.excel_headers
+                         if any(k in h for k in ('姓名','名字','name'))), None)
+        names = self.excel_data.get(name_col,[]) if name_col else []
+        id_map = {v.strip(): (names[i] if i < len(names) else '') for i,v in enumerate(vals)}
+        n = 0
+        for c in self.cells:
+            if c['id'].strip() in id_map:
+                c['excel_name'] = id_map[c['id'].strip()]; n += 1
+        self._refresh_list()
+        if self.cells: self._show(self.current)
 
-        # 讀 Excel 學號 + 姓名
-        excel_ids, excel_names = [], []
-        if self.excel_data:
-            id_col = guess_id_col(self.excel_data, self.excel_headers)
-            name_col = next((h for h in self.excel_headers if '姓名' in h or 'name' in h.lower()), None)
-            if id_col:
-                excel_ids = self.excel_data[id_col]
-                excel_names = self.excel_data[name_col] if name_col else ['']*len(excel_ids)
+    def _process_all_sheets(self):
+        """掃描資料夾內所有圖片，每張當作相片表處理。"""
+        files = sorted([
+            os.path.join(self.folder, f) for f in os.listdir(self.folder)
+            if os.path.splitext(f)[1].lower() in IMAGE_EXTS
+        ])
+        if not files:
+            messagebox.showwarning('','資料夾中沒有找到圖片'); return
 
-        excel_set = set(excel_ids)
-        matched_ids = set()
-        items = []
+        self.cells = []
+        self.export_btn.config(state='disabled')
+        self.quick_btn.config(state='disabled')
+        total = len(files)
+        pd = ProgressDlg(self.app, f'正在偵測格線… (0/{total})', total)
 
-        for p in photos:
-            auto_id = p['auto_id']
-            if auto_id and auto_id in excel_set:
-                idx = excel_ids.index(auto_id)
-                items.append({'type':'matched','path':p['path'],'filename':p['filename'],
-                              'id':auto_id,'auto_id':auto_id,
-                              'excel_name':excel_names[idx] if idx < len(excel_names) else '',
-                              '_img':None})
-                matched_ids.add(auto_id)
-            else:
-                items.append({'type':'orphan' if excel_ids else 'unmatched',
-                              'path':p['path'],'filename':p['filename'],
-                              'id':auto_id,'auto_id':auto_id,'excel_name':'',
-                              '_img':None})
+        def _worker():
+            all_cells = []
+            for k, path in enumerate(files):
+                try:
+                    img = Image.open(path).convert('RGB')
+                    img = orient_image(img)   # ← 先轉正！掃歪的表格 OCR 才能讀到文字
+                    col_bands, photo_rows = detect_grid(img)
+                    if not col_bands or not photo_rows:
+                        self.app.after(0, lambda k=k: pd.step(k+1, f'跳過（無格線）{k+1}/{total}'))
+                        continue
+                    cells = extract_cells(img, col_bands, photo_rows)
+                    sheet_name = os.path.splitext(os.path.basename(path))[0]
+                    for c in cells:
+                        c['_sheet_path'] = path
+                        c['_sheet_img']  = img
+                        c['_sheet_name'] = sheet_name
+                        c['excel_name']  = ''
+                        c['dup'] = False
+                    all_cells.extend(cells)
+                    self.app.after(0, lambda k=k, n=len(cells):
+                        pd.step(k+1, f'處理 {k+1}/{total}，已提取 {len(all_cells)} 張'))
+                except Exception:
+                    pass
 
-        for eid, name in zip(excel_ids, excel_names):
-            if eid not in matched_ids:
-                items.append({'type':'missing','path':None,'filename':'',
-                              'id':eid,'auto_id':eid,'excel_name':name,'_img':None})
+            def _done():
+                pd.close()
+                self.cells = all_cells
+                if not self.cells:
+                    messagebox.showwarning('','未從任何相片表中提取到學生照片'); return
+                check_duplicates(self.cells)
+                filled = sum(1 for c in self.cells if c['id'].strip())
+                self.stat_lbl.config(text=(
+                    f'共 {total} 張相片表\n'
+                    f'提取 {len(self.cells)} 位學生\n'
+                    f'已辨識 {filled} 筆學號'))
+                self._refresh_list(); self._show(0)
+                self.next_btn.config(state='normal')
+                # OCR 背景啟動
+                if OCR_OK and LICENSE.allowed('ocr'):
+                    self._start_batch_ocr()
+                else:
+                    self.export_btn.config(state='normal')
+                    self.quick_btn.config(state='normal')
+                if self.excel_data and self.xl_col_combo.get():
+                    self._on_col_select(None)
+            self.app.after(0, _done)
 
-        self.items = items
-        self._update_stats()
-        self._apply_filter()
-        self.export_btn.config(state='normal' if items else 'disabled')
+        threading.Thread(target=_worker, daemon=True).start()
 
-    def _update_stats(self):
-        from collections import Counter
-        cnt = Counter(it['type'] for it in self.items)
-        self.stat_lbl.config(text=(
-            f"總計　{len(self.items)} 筆\n"
-            f"✓ 配對　{cnt.get('matched',0)}\n"
-            f"? 未配對　{cnt.get('unmatched',0)+cnt.get('orphan',0)}\n"
-            f"✗ 缺照片　{cnt.get('missing',0)}"))
+    def _start_batch_ocr(self):
+        """對所有格子背景 OCR，完成後才解鎖匯出。"""
+        self.export_btn.config(state='disabled', text='⋯ OCR 辨識中，請稍候')
+        self.quick_btn.config(state='disabled')
+        total = len(self.cells)
 
-    def _apply_filter(self):
-        f = self.filter_var.get()
-        if f == 'all':
-            self.filtered = list(range(len(self.items)))
-        elif f == 'unmatched':
-            self.filtered = [i for i,it in enumerate(self.items) if it['type'] in ('unmatched','orphan')]
-        else:
-            self.filtered = [i for i,it in enumerate(self.items) if it['type'] == f]
-        self._rebuild_list()
+        def _worker():
+            # 以表格為單位分組，每個表格的 row_tops 各自計算
+            from collections import defaultdict
+            sheet_row_tops = defaultdict(list)
+            for c in self.cells:
+                sheet_row_tops[c['_sheet_path']].append(c['_cell_box'][1])
+            for path in sheet_row_tops:
+                sheet_row_tops[path] = sorted(set(sheet_row_tops[path]))
 
-    def _rebuild_list(self):
-        self.listbox.delete(0,'end')
-        for fi in self.filtered:
-            it = self.items[fi]
-            if it['type'] == 'matched':
-                txt = f"  ✓  {it['id']}  {it['excel_name']}  ←  {it['filename']}"
-            elif it['type'] == 'missing':
-                txt = f"  ✗  {it['id']}  {it['excel_name']}  ← 缺照片"
-            else:
-                txt = f"  ?  {it['filename']}  (ID: {it['id'] or '—'})"
-            self.listbox.insert('end', txt)
-            self.listbox.itemconfig(self.listbox.size()-1, fg=self.STATUS_COLOR.get(it['type'],C['ink']))
+            for k, c in enumerate(self.cells):
+                img = c.get('_sheet_img')
+                if img is None: continue
+                row_tops = sheet_row_tops[c['_sheet_path']]
+                y = c['_cell_box'][1]
+                later = [t for t in row_tops if t > y]
+                c['id'] = ocr_id_below(img, c['_cell_box'],
+                                        next_row_top=min(later) if later else None)
+                self.app.after(0, lambda k=k: self._on_ocr_step(k))
+            self.app.after(0, self._on_ocr_done)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_ocr_step(self, k):
+        check_duplicates(self.cells); self._refresh_list()
+        if k == self.current: self._show(self.current)
+
+    def _on_ocr_done(self):
+        self._ocr_running = False
+        check_duplicates(self.cells); self._refresh_list()
+        self.export_btn.config(state='normal', text='批次儲存 ZIP　→')
+        self.quick_btn.config(state='normal')
+        filled = sum(1 for c in self.cells if c['id'].strip())
+        self.stat_lbl.config(
+            text='\n'.join(self.stat_lbl.cget('text').split('\n')[:2])
+            + f'\n已辨識 {filled}/{len(self.cells)} 筆 ✓')
+        if self.excel_data and self.xl_col_combo.get():
+            self._on_col_select(None)
+
+    # ── 審閱互動（與 SheetTab 邏輯一致）─────────────────────
+
+    def _refresh_list(self):
+        q = self.search_var.get().strip().lower()
+        self.listbox.delete(0,'end'); self._list_map = []
+        for i, c in enumerate(self.cells):
+            sid = c['id']; sht = c.get('_sheet_name','')
+            if q and q not in sid.lower() and q not in sht.lower() and q not in str(i+1): continue
+            mark = '✓' if sid.strip() else '○'
+            extra = ' ⚠ 重複' if c.get('dup') else ''
+            self.listbox.insert('end', f'  {mark}  [{sht}]  {i+1:3d}.  {sid or "（未填）"}{extra}')
+            fg = C['warn'] if c.get('dup') else (C['ok'] if sid.strip() else C['err'])
+            self.listbox.itemconfig(self.listbox.size()-1, fg=fg)
+            self._list_map.append(i)
+
+    def _show(self, idx):
+        if not self.cells or not (0 <= idx < len(self.cells)): return
+        self.current = idx; c = self.cells[idx]
+        preview = c['image'].copy(); preview.thumbnail((160,200))
+        tk_img = ImageTk.PhotoImage(preview)
+        self.photo_lbl.config(image=tk_img, text=''); self.photo_lbl.image = tk_img
+        total = len(self.cells)
+        filled = sum(1 for cc in self.cells if cc['id'].strip())
+        self.prog_lbl.config(
+            text=f'{idx+1}/{total}　✓{filled}',
+            fg=C['ok'] if filled==total else C['muted'])
+        self.name_lbl.config(text=c.get('excel_name',''))
+        self.sheet_lbl.config(text=f'來源：{c.get("_sheet_name","")}')
+        self.id_var.set(c['id']); self.id_entry.focus(); self.id_entry.selection_range(0,'end')
+        self.prev_btn.config(state='normal' if idx > 0 else 'disabled')
+        is_last = idx == total-1
+        self.next_btn.config(text='完成 ✓' if is_last else '下一張 ▶',
+                             bg=C['accent_dk'] if is_last else C['accent'])
+        self.dup_lbl.config(text='⚠ 此學號重複！' if c.get('dup') else '按 Enter 跳下一張',
+                            fg=C['warn'] if c.get('dup') else C['accent_dk'])
+        for lb_i, ci in enumerate(self._list_map):
+            if ci == idx:
+                self.listbox.selection_clear(0,'end')
+                self.listbox.selection_set(lb_i); self.listbox.see(lb_i); break
+
+    def _zoom_preview(self):
+        if not self.cells: return
+        ZoomDialog(self.app, self.cells[self.current])
+
+    def _save_cur(self):
+        if self.current < len(self.cells):
+            self.cells[self.current]['id'] = self.id_var.get().strip()
+        check_duplicates(self.cells); self._refresh_list()
+
+    def _prev(self): self._save_cur(); self._show(self.current-1)
+    def _next(self):
+        self._save_cur()
+        if self.current < len(self.cells)-1: self._show(self.current+1)
 
     def _on_list(self, _e):
         sel = self.listbox.curselection()
         if not sel: return
-        fi = self.filtered[sel[0]]
-        # ── 釋放前一張全圖（memory：只保留當前一張）──
-        if self.current >= 0 and self.current != fi:
-            prev = self.items[self.current]
-            if prev.get('_img') is not None:
-                prev['_img'] = None   # GC 會回收
-        self.current = fi
-        it = self.items[fi]
-        self.batch_id_var.set(it['id'])
-        status_map = {'matched':'已配對','missing':'缺照片','unmatched':'未配對','orphan':'無對應學生'}
-        info = (f"狀態：{status_map.get(it['type'],'—')}\n"
-                f"學號：{it['id'] or '—'}\n"
-                f"姓名：{it['excel_name'] or '—'}\n"
-                f"檔案：{it['filename'] or '—'}")
-        self.status_lbl.config(text=info)
-        if it['path']:
-            if it['_img'] is None:
-                try:
-                    raw = Image.open(it['path']).convert('RGB')
-                    cleaned = strip_photo_borders(np.asarray(raw))
-                    it['_img'] = Image.fromarray(cleaned)
-                except Exception: it['_img'] = None
-            if it['_img']:
-                thumb = it['_img'].copy(); thumb.thumbnail((240,300))
-                tk_img = ImageTk.PhotoImage(thumb)
-                self.preview.config(image=tk_img, text=''); self.preview.image = tk_img
-                return
-        self.preview.config(image='', text='缺照片' if it['type']=='missing' else '無法載入')
-        self.preview.image = None
+        ci = self._list_map[sel[0]] if self._list_map else sel[0]
+        if ci == self.current: return
+        self._save_cur(); self._show(ci)
 
-    def _assign_id(self):
-        if self.current < 0: return
-        new_id = self.batch_id_var.get().strip()
-        it = self.items[self.current]
-        old_type = it['type']
-        it['id'] = new_id
-        # 更新配對狀態
-        excel_ids = []
-        if self.excel_data:
-            id_col = guess_id_col(self.excel_data, self.excel_headers)
-            if id_col: excel_ids = self.excel_data[id_col]
-        if new_id in excel_ids:
-            it['type'] = 'matched'
-            idx = excel_ids.index(new_id)
-            name_col = next((h for h in self.excel_headers if '姓名' in h or 'name' in h.lower()), None)
-            it['excel_name'] = self.excel_data[name_col][idx] if name_col and idx < len(self.excel_data[name_col]) else ''
-        self._update_stats(); self._apply_filter()
+    def _rotate(self, deg):
+        if not self.cells: return
+        c = self.cells[self.current]
+        c['rotation'] = (c['rotation']+deg)%360; c['image'] = render_cell(c)
+        self._show(self.current)
 
     def _open_cropper(self):
-        if self.current < 0: return
-        it = self.items[self.current]
-        if not it['path'] or it['_img'] is None: return
-        cell = {'_orig': it['_img'].copy(), 'rotation': 0, 'image': None}
-        cell['image'] = render_cell(cell)
-        dlg = CropperDialog(self.app, cell)
-        self.app.wait_window(dlg)   # 等套用後才繼續
-        it['_img'] = cell['_orig']
-        # 刷新預覽縮圖
-        thumb = it['_img'].copy(); thumb.thumbnail((240, 300))
-        tk_img = ImageTk.PhotoImage(thumb)
-        self.preview.config(image=tk_img, text='')
-        self.preview.image = tk_img
+        if not self.cells: return
+        self._save_cur()
+        dlg = CropperDialog(self.app, self.cells[self.current])
+        self.app.wait_window(dlg)
+        self._show(self.current)
+
+    def _split_cell(self):
+        """把當前格子（含兩位學生）拆成左右兩個獨立格子。"""
+        if not self.cells: return
+        self._save_cur()
+
+        def on_split(left_img, right_img):
+            c = self.cells[self.current]
+            base = {
+                '_cell_box':   c.get('_cell_box'),
+                '_sheet_path': c.get('_sheet_path', ''),
+                '_sheet_img':  c.get('_sheet_img'),
+                '_sheet_name': c.get('_sheet_name', ''),
+                'excel_name': '', 'dup': False,
+            }
+            c_left  = {**base, 'row': c['row'], 'col': c['col'],
+                       '_orig': left_img,  'rotation': 0, 'id': ''}
+            c_right = {**base, 'row': c['row'], 'col': c['col'] + 0.5,
+                       '_orig': right_img, 'rotation': 0, 'id': ''}
+            c_left['image']  = render_cell(c_left)
+            c_right['image'] = render_cell(c_right)
+            idx = self.current
+            self.cells[idx:idx+1] = [c_left, c_right]
+            check_duplicates(self.cells)
+            self._refresh_list()
+            self._show(idx)
+
+        CellSplitDialog(self.app, self.cells[self.current], on_split)
+
+    def _apply_matting(self):
+        if not self.cells: return
+        if not REMBG_OK or not LICENSE.allowed('matting'): return
+        c = self.cells[self.current]
+        def _w():
+            try:
+                white = matting_to_white(render_cell(c))
+                c['_orig']=white; c['rotation']=0; c['image']=white.copy()
+            except Exception as e:
+                self.app.after(0, lambda:messagebox.showwarning('去背失敗',str(e)))
+            self.app.after(0, lambda: self._show(self.current))
+        threading.Thread(target=_w, daemon=True).start()
+
+    # ── 匯出 ─────────────────────────────────────────────────
 
     def _export(self):
-        matched = [it for it in self.items if it['type']=='matched' and it['path']]
-        if not matched: messagebox.showinfo('','沒有可匯出的已配對照片'); return
-        do_matting = REMBG_OK and self.matting_var.get()
+        if not self.cells: return
+        self._save_cur()
+        if self._ocr_running:
+            messagebox.showwarning('','OCR 尚未完成，請稍候'); return
+        empty = [i+1 for i,c in enumerate(self.cells) if not c['id'].strip()]
+        if empty and not messagebox.askyesno('有空白學號',
+            f'第 {empty[:5]}{"…" if len(empty)>5 else ""} 張未填，將以 photo_N 命名。繼續？'): return
         zip_path = filedialog.asksaveasfilename(
-            title='批次匯出 ZIP', defaultextension='.zip',
+            title='批次儲存 ZIP', defaultextension='.zip',
             initialfile='批次照片.zip', filetypes=[('ZIP','*.zip')])
         if not zip_path: return
-        label = '正在 AI 去背並匯出…' if do_matting else '正在匯出…'
-        pd = ProgressDlg(self.app, label, len(matched))
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf,'w',compression=zipfile.ZIP_DEFLATED) as zf:
-            for k, it in enumerate(matched):
-                try:
-                    raw = Image.open(it['path']).convert('RGB')
-                    cleaned = strip_photo_borders(np.asarray(raw))
-                    img = Image.fromarray(cleaned)
-                    if do_matting:
-                        out = matting_to_white(img)         # AI 去背白底
-                    else:
-                        out = img.resize((420,530), Image.LANCZOS)
-                    ib = io.BytesIO(); out.save(ib,'JPEG',quality=95)
-                    name = safe_filename(it['id'])
-                    zf.writestr(f'{name}.jpg', ib.getvalue())
-                except Exception as e:
-                    pd.close(); messagebox.showerror('錯誤',f"處理 {it['filename']} 失敗：{e}"); return
-                pd.step(k+1, f'{"去背" if do_matting else "匯出"} {k+1}/{len(matched)}')
-        pd.close()
-        with open(zip_path,'wb') as f: f.write(buf.getvalue())
-        suffix = '（AI 去背白底）' if do_matting else ''
-        messagebox.showinfo('完成',f'已匯出 {len(matched)} 張{suffix}\n儲存：{zip_path}')
+        self.export_btn.config(state='disabled')
+        total = len(self.cells); snap = list(self.cells)
+        pd = ProgressDlg(self.app,'正在儲存…',total)
+
+        def _w():
+            try:
+                seen={}; buf=io.BytesIO()
+                with zipfile.ZipFile(buf,'w',compression=zipfile.ZIP_DEFLATED) as zf:
+                    for i,c in enumerate(snap):
+                        sid=c['id'].strip()
+                        name=safe_filename(sid) if sid else f'photo_{i+1}'
+                        seen[name]=seen.get(name,0)+1
+                        if seen[name]>1: name=f'{name}_{seen[name]}'
+                        ib=io.BytesIO(); render_cell(c).save(ib,'JPEG',quality=95)
+                        zf.writestr(f'{name}.jpg',ib.getvalue())
+                        self.app.after(0,lambda v=i+1:pd.step(v,f'儲存 {v}/{total}'))
+                bv=buf.getvalue()
+                def _done():
+                    pd.close()
+                    with open(zip_path,'wb') as f: f.write(bv)
+                    self.export_btn.config(state='normal')
+                    self.app.bell()
+                    messagebox.showinfo('完成 ✓',f'已儲存 {total} 張\n\n📁 {zip_path}')
+                self.app.after(0,_done)
+            except Exception as e:
+                def _err(m=str(e)):
+                    pd.close(); self.export_btn.config(state='normal')
+                    messagebox.showerror('儲存失敗',m)
+                self.app.after(0,_err)
+        threading.Thread(target=_w, daemon=True).start()
+
+    def _quick_export(self):
+        if not self.cells: return
+        empty=[i+1 for i,c in enumerate(self.cells) if not c['id'].strip()]
+        filled=len(self.cells)-len(empty)
+        if not messagebox.askyesno('⚡ 信任 OCR 直接存',
+            f'已辨識 {filled}/{len(self.cells)} 筆學號，確定不逐張確認直接儲存？'): return
+        self._export()
 
     def _export_csv(self):
-        if not self.items: messagebox.showinfo('','請先載入資料'); return
-        path = filedialog.asksaveasfilename(
-            title='儲存 CSV 報表', defaultextension='.csv',
-            initialfile='批次報表.csv', filetypes=[('CSV','*.csv')])
+        if not self.cells: messagebox.showinfo('','請先載入相片表'); return
+        self._save_cur()
+        path=filedialog.asksaveasfilename(title='CSV 報表',defaultextension='.csv',
+            initialfile='批次報表.csv',filetypes=[('CSV','*.csv')])
         if not path: return
-        status_map = {'matched':'已配對','missing':'缺照片','unmatched':'未配對','orphan':'無對應'}
         with open(path,'w',newline='',encoding='utf-8-sig') as f:
-            w = csv.writer(f)
-            w.writerow(['學號','姓名','狀態','照片檔名'])
-            for it in self.items:
-                w.writerow([it['id'],it['excel_name'],status_map.get(it['type'],'—'),it['filename']])
+            w=csv.writer(f); w.writerow(['序號','來源表格','學號','姓名','狀態','備註'])
+            for i,c in enumerate(self.cells):
+                sid=c['id'].strip()
+                w.writerow([i+1,c.get('_sheet_name',''),sid,c.get('excel_name',''),
+                             '已填' if sid else '未填','學號重複' if c.get('dup') else ''])
         messagebox.showinfo('完成',f'報表已儲存：{path}')
 
-
-# ════════════════════════════════════════════════════════════
-#  主視窗
-# ════════════════════════════════════════════════════════════
 
 class App(tk.Tk):
     def __init__(self):
