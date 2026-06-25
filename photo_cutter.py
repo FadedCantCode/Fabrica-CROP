@@ -17,7 +17,7 @@
            PyJWT + cryptography（授權驗證）
 """
 VERSION = '1.0.0'
-GITHUB_REPO = 'YOUR_GITHUB_USER/photo-cutter'   # ← 填你的 repo
+GITHUB_REPO = 'FadedCantCode/Fabrica-CROP'
 
 import os, io, re, csv, json, zipfile, threading, datetime, urllib.request
 import tkinter as tk
